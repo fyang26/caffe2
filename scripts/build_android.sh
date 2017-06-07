@@ -24,12 +24,12 @@ CAFFE2_ROOT="$( cd "$(dirname "$0")"/.. ; pwd -P)"
 echo "Caffe2 codebase root is: $CAFFE2_ROOT"
 # Now, actually build the android target. Let's find the most recent version
 # of android ndk under /opt/android_ndk.
-NDK_VERSION="$(ls -1 /opt/android_ndk/ | sort | tail -1)"
+NDK_VERSION="$(ls -1 /Users/fyang4/Library/Android/sdk/ndk-bundle | sort | tail -1)"
 if [ -z "$NDK_VERSION" ]; then
-    echo "Cannot find ndk: did you install it under /opt/android_ndk?"
+    echo "Cannot find ndk: did you install it under /Users/fyang4/Library/Android/sdk/ndk-bundle?"
     exit 1
 fi
-NDK_ROOT=/opt/android_ndk/$NDK_VERSION/
+NDK_ROOT=/Users/fyang4/Library/Android/sdk/ndk-bundle/
 echo "Using Android ndk at $NDK_ROOT"
 # We are going to build the target into build_android.
 BUILD_ROOT=$CAFFE2_ROOT/build_android
@@ -62,5 +62,6 @@ cmake .. \
     -DUSE_OPENMP=OFF \
     -DBUILD_SHARED_LIBS=OFF \
     -DCMAKE_CXX_FLAGS_RELEASE=-s \
+    -DUSE_GLOG=OFF \
     || exit 1
 make
