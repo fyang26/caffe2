@@ -23,6 +23,9 @@ extern "C" {
 
 namespace caffe2 {
 
+template <class Context>
+class Tensor;
+
 // An empty class as a placeholder for a math function that has no specific
 // engine specified.
 class DefaultEngine {};
@@ -59,6 +62,12 @@ template <typename T, class Context>
 void Exp(const int N, const T* x, T* y, Context* context);
 template <typename T, class Context>
 void Log(const int N, const T* x, T* y, Context* context);
+template <typename T, class Context>
+void Cos(const int N, const T* x, T* y, Context* context);
+template <typename T, class Context>
+void Sin(const int N, const T* x, T* y, Context* context);
+template <typename T, class Context>
+void Abs(const int N, const T* x, T* y, Context* context);
 template <typename T, class Context>
 void Sqr(const int N, const T* x, T* y, Context* context);
 
@@ -223,11 +232,17 @@ void Dot(const int N, const T* a, const T* b, T* y, Context* context);
 
 // Sum of vector x, and writes the result to a single value y.
 template <typename T, class Context>
-void Sum(const int N, const T* x, T* y, Context* context);
+void Sum(const int N, const T* x, T* y, Context* context,
+         Tensor<Context>* scratch_ptr = nullptr);
 
 // Sum of squares of vector x, and writes the result to a single value y.
 template <typename T, class Context>
-void SumSqr(const int N, const T* x, T* y, Context* context);
+void SumSqr(
+    const int N,
+    const T* x,
+    T* y,
+    Context* context,
+    Tensor<Context>* scratch_ptr = nullptr);
 
 // Select does index selection of the rows a N*D matrix x, and gives the N
 // dimensional vector y that contains the selected data.
@@ -363,7 +378,7 @@ inline bool is_a_ge_zero_and_a_lt_b(int a, int b) {
 // Calculates ceil(a / b). User must be careful to ensure that there
 // is no overflow or underflow in the calculation.
 template <typename T>
-inline T divUp(T a, T b) {
+constexpr T divUp(T a, T b) {
   return (a + b - (T) 1) / b;
 }
 
@@ -371,10 +386,27 @@ inline T divUp(T a, T b) {
 // to ensure that there is no overflow or underflow in the calculation
 // of divUp.
 template <typename T>
-inline T roundUp(T a, T b) {
+constexpr T roundUp(T a, T b) {
   return divUp<T>(a, b) * b;
 }
 
+// Returns true if the given integer type is a power-of-2 (positive only)
+template <typename T>
+constexpr bool integerIsPowerOf2(T v) {
+  return (v && !(v & (v - 1)));
+}
+
+// Returns log2(n) for a positive integer type
+template <typename T>
+constexpr int integerLog2(T n, int p = 0) {
+  return (n <= 1) ? p : integerLog2(n / 2, p + 1);
+}
+
+// Returns the next highest power-of-2 for an integer type
+template <typename T>
+constexpr T integerNextHighestPowerOf2(T v) {
+  return (integerIsPowerOf2(v) ? (T)2 * v : ((T)1 << (integerLog2(v) + 1)));
+}
 
 }  // namespace math
 }  // namespace caffe2

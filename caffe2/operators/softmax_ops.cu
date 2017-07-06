@@ -102,29 +102,6 @@ __global__ void ProbCrossEntropyGradientKernel(
   }
 }
 
-__global__ void
-RowMaxKernel(const int rows, const int cols, const float* data, float* out) {
-  typedef cub::BlockReduce<float, CAFFE_CUDA_NUM_THREADS> BlockReduce;
-  __shared__ typename BlockReduce::TempStorage temp_storage;
-  for (int rowIndex = blockIdx.x; rowIndex < rows; rowIndex += gridDim.x) {
-    float maxval = -FLT_MAX;
-    // NB: The memory accesses here are sequentialized; without unrolling
-    // the loop, there will not be any ILP.  However, because we are running
-    // this kernel with a lot of threads, this should not be a big problem.
-    // However, if we reduce the number of threads to take advantage of
-    // warp-wide
-    // synchronization, this may become a problem again.
-    for (int colIndex = threadIdx.x; colIndex < cols; colIndex += blockDim.x) {
-      maxval = max(data[rowIndex * cols + colIndex], maxval);
-    }
-    maxval = BlockReduce(temp_storage).Reduce(maxval, cub::Max());
-    if (threadIdx.x == 0) {
-      out[rowIndex] = maxval;
-    }
-    __syncthreads();
-  }
-}
-
 __global__ void SpatialSoftmaxKernel(
     const int num,
     const int D,
@@ -264,11 +241,7 @@ void Softmax(
     CUDAContext* context) {
   const int size = N * D;
 
-  RowMaxKernel<<<
-      std::min(N, CAFFE_MAXIMUM_NUM_BLOCKS),
-      CAFFE_CUDA_NUM_THREADS,
-      0,
-      context->cuda_stream()>>>(N, D, logits, rowmax);
+  math::RowwiseMax<float, CUDAContext>(N, D, logits, rowmax, context);
   // Put the intermediate result X - max(X) into Y
   context->Copy<float, CUDAContext, CUDAContext>(size, logits, probs);
   // Subtract the scale
@@ -392,7 +365,7 @@ bool SoftmaxWithLossOp<float, CUDAContext>::RunOnDevice() {
   if (weights) {
     // Sum weights
     math::Sum<float, CUDAContext>(
-        N, weights, total_weight_ptr_.mutable_data<float>(), &context_);
+        N, weights, total_weight_ptr_.mutable_data<float>(), &context_, &scratch_);
     cudaMemcpyAsync(
         &total_weight,
         total_weight_ptr_.data<float>(),
@@ -404,7 +377,7 @@ bool SoftmaxWithLossOp<float, CUDAContext>::RunOnDevice() {
   // Sum of all losses
   float* avg_loss_data = avg_loss->mutable_data<float>();
   math::Sum<float, CUDAContext>(
-      losses_.size(), losses_.data<float>(), avg_loss_data, &context_);
+      losses_.size(), losses_.data<float>(), avg_loss_data, &context_, &scratch_);
   // Average of input batch size
   if (total_weight > 0) {
     math::Scale<float, CUDAContext>(
@@ -479,7 +452,8 @@ bool SpatialSoftmaxWithLossOp<float, CUDAContext>::RunOnDevice() {
       weights_.size(),
       weights_.data<float>(),
       total_weight_ptr_.mutable_data<float>(),
-      &context_);
+      &context_,
+      &scratch_);
   cudaMemcpyAsync(
       &h_total_weight,
       total_weight_ptr_.data<float>(),
@@ -488,7 +462,7 @@ bool SpatialSoftmaxWithLossOp<float, CUDAContext>::RunOnDevice() {
       context_.cuda_stream());
 
   math::Sum<float, CUDAContext>(
-      losses_.size(), losses_.data<float>(), avg_loss_data, &context_);
+      losses_.size(), losses_.data<float>(), avg_loss_data, &context_, &scratch_);
 
   // Final scaling
   if (h_total_weight > 0) {
@@ -582,7 +556,7 @@ bool SoftmaxWithLossGradientOp<float, CUDAContext>::RunOnDevice() {
   if (weights) {
     // Sum weights
     math::Sum<float, CUDAContext>(
-        N, weights, total_weight_ptr_.mutable_data<float>(), &context_);
+        N, weights, total_weight_ptr_.mutable_data<float>(), &context_, &scratch_);
     cudaMemcpyAsync(
         &total_weight,
         total_weight_ptr_.data<float>(),
@@ -669,7 +643,8 @@ bool SpatialSoftmaxWithLossGradientOp<float, CUDAContext>::RunOnDevice() {
       weights_.size(),
       weights_.data<float>(),
       total_weight_ptr_.mutable_data<float>(),
-      &context_);
+      &context_,
+      &scratch_);
 
   // Somewhat awkward scalar passing from device to host
   float h_total_weight;

@@ -1,13 +1,11 @@
 // Implements the math functions for CPU.
-
-#include <thrust/device_ptr.h>
-#include <thrust/reduce.h>
-#include <thrust/system/cuda/detail/par.h>
-#include <thrust/version.h>
+#include <cub/block/block_reduce.cuh>
 
 #include "caffe2/core/context_gpu.h"
 #include "caffe2/utils/conversions.h"
 #include "caffe2/utils/math.h"
+
+#include <cub/cub.cuh>
 
 #if THRUST_VERSION >= 100800
 #define THRUST_SUPPORTS_PER_THREAD
@@ -34,6 +32,9 @@ void Funcname<T, CUDAContext>(                                                 \
 
 DELEGATE_SIMPLE_CUDA_UNARY_FUNCTION(float, Exp, expf);
 DELEGATE_SIMPLE_CUDA_UNARY_FUNCTION(float, Log, logf);
+DELEGATE_SIMPLE_CUDA_UNARY_FUNCTION(float, Cos, cosf);
+DELEGATE_SIMPLE_CUDA_UNARY_FUNCTION(float, Sin, sinf);
+DELEGATE_SIMPLE_CUDA_UNARY_FUNCTION(float, Abs, fabsf);
 
 __device__ float cuda_sqrf(const float x) { return x * x; }
 
@@ -550,28 +551,152 @@ __global__ void SumKernel(const int N, const T* X, T* Y, bool square) {
   }
 }
 
-#define CAFFE2_MATH_SUM_FUNC(T)                                       \
-  template <>                                                         \
-  void Sum<T, CUDAContext>(                                           \
-      const int N, const T* x, T* y, CUDAContext* context) {          \
-    SumKernel<<<1, SUM_KERNEL_NTHREADS, 0, context->cuda_stream()>>>( \
-        N, x, y, false);                                              \
+// According to the benchmarks script
+// caffe2/caffe2/experiments/python/device_reduce_sum_bench.py,
+// device reduce is slower for N <= 10000.
+#define DEVICE_REDUCE_SIZE_THRESHOLD 10000
+
+namespace {
+
+template <typename T>
+__global__ void SumConvertKernel(float* sum, T* dest) {
+  *dest = convert::To<float, T>(*sum);
+}
+
+template <typename FloatIterT>
+void SumFloatIter(
+    const int N,
+    FloatIterT it,
+    float*& dest,
+    CUDAContext* context,
+    Tensor<CUDAContext>* scratch_ptr) {
+  size_t memRequired = 0;
+  cub::DeviceReduce::Sum(
+      nullptr, memRequired, it, dest, N, context->cuda_stream());
+  auto buffer_size =
+      static_cast<TIndex>((memRequired + sizeof(float) - 1) / sizeof(float));
+  if (!dest) {
+    // allocate one more float at the end of scratch for dest
+    scratch_ptr->Resize(std::vector<TIndex>{buffer_size + 1});
+    dest = scratch_ptr->template mutable_data<float>() + buffer_size;
+  } else {
+    scratch_ptr->Resize(std::vector<TIndex>{buffer_size});
+  }
+  cub::DeviceReduce::Sum(
+      static_cast<void*>(scratch_ptr->template mutable_data<float>()),
+      memRequired,
+      it,
+      dest,
+      N,
+      context->cuda_stream());
+}
+} // namespace
+
+template <>
+void Sum<float, CUDAContext>(
+    const int N,
+    const float* x,
+    float* y,
+    CUDAContext* context,
+    Tensor<CUDAContext>* scratch_ptr) {
+  if (scratch_ptr && N > DEVICE_REDUCE_SIZE_THRESHOLD) {
+    SumFloatIter(N, x, y, context, scratch_ptr);
+  } else {
+    SumKernel<<<1, SUM_KERNEL_NTHREADS, 0, context->cuda_stream()>>>(
+      N, x, y, false);
+  }
+}
+
+namespace {
+template <typename T>
+struct FloatTransform {
+  inline __host__ __device__ float operator()(const T v) const {
+    return convert::To<T, float>(v);
+  }
+};
+} // namespace
+
+#define CAFFE2_MATH_SUM_FUNC(T)                                           \
+  template <>                                                             \
+  void Sum<T, CUDAContext>(                                               \
+      const int N,                                                        \
+      const T* x,                                                         \
+      T* y,                                                               \
+      CUDAContext* context,                                               \
+      Tensor<CUDAContext>* scratch_ptr) {                                 \
+    if (scratch_ptr && N > DEVICE_REDUCE_SIZE_THRESHOLD) {                \
+      FloatTransform<T> transform;                                        \
+      cub::TransformInputIterator<float, FloatTransform<T>, const T*> it( \
+          x, transform);                                                  \
+      float* sum = nullptr;                                               \
+      SumFloatIter(N, it, sum, context, scratch_ptr);                     \
+      SumConvertKernel<<<1, 1, 0, context->cuda_stream()>>>(sum, y);      \
+    } else {                                                              \
+      SumKernel<<<1, SUM_KERNEL_NTHREADS, 0, context->cuda_stream()>>>(   \
+          N, x, y, false);                                                \
+    }                                                                     \
   }
 
-CAFFE2_MATH_SUM_FUNC(float)
 CAFFE2_MATH_SUM_FUNC(float16)
 #undef CAFFE2_MATH_SUM_FUNC
 
-#define CAFFE2_MATH_SUMSQR_FUNC(T)                                    \
-  template <>                                                         \
-  void SumSqr<T, CUDAContext>(                                        \
-      const int N, const T* x, T* y, CUDAContext* context) {          \
-    SumKernel<<<1, SUM_KERNEL_NTHREADS, 0, context->cuda_stream()>>>( \
-        N, x, y, true);                                               \
+namespace {
+template <typename T>
+struct SqrTransform {
+  inline __host__ __device__ T operator()(const T v) const {
+    return v * v;
+  }
+};
+} //  namespace
+
+template <>
+void SumSqr<float, CUDAContext>(
+    const int N,
+    const float* x,
+    float* y,
+    CUDAContext* context,
+    Tensor<CUDAContext>* scratch_ptr) {
+  if (scratch_ptr && N > DEVICE_REDUCE_SIZE_THRESHOLD) {
+    SqrTransform<float> transform;
+    cub::TransformInputIterator<float, SqrTransform<float>, const float*> it(
+        x, transform);
+    SumFloatIter(N, it, y, context, scratch_ptr);
+  } else {
+    SumKernel<<<1, SUM_KERNEL_NTHREADS, 0, context->cuda_stream()>>>(
+        N, x, y, true);
+  }
+}
+
+#define CAFFE2_MATH_SUMSQR_FUNC(T)                                      \
+  template <>                                                           \
+  void SumSqr<T, CUDAContext>(                                          \
+      const int N,                                                      \
+      const T* x,                                                       \
+      T* y,                                                             \
+      CUDAContext* context,                                             \
+      Tensor<CUDAContext>* scratch_ptr) {                               \
+    if (scratch_ptr && N > DEVICE_REDUCE_SIZE_THRESHOLD) {              \
+      FloatTransform<T> float_transform;                                \
+      cub::TransformInputIterator<float, FloatTransform<T>, const T*>   \
+          float_it(x, float_transform);                                 \
+      SqrTransform<float> sqr_transform;                                \
+      cub::TransformInputIterator<                                      \
+          float,                                                        \
+          SqrTransform<float>,                                          \
+          decltype(float_it)>                                           \
+          it(float_it, sqr_transform);                                  \
+      float* sum = nullptr;                                             \
+      SumFloatIter(N, it, sum, context, scratch_ptr);                   \
+      SumConvertKernel<<<1, 1, 0, context->cuda_stream()>>>(sum, y);    \
+    } else {                                                            \
+      SumKernel<<<1, SUM_KERNEL_NTHREADS, 0, context->cuda_stream()>>>( \
+          N, x, y, true);                                               \
+    }                                                                   \
   }
 
-CAFFE2_MATH_SUMSQR_FUNC(float)
+CAFFE2_MATH_SUMSQR_FUNC(float16)
 #undef CAFFE2_MATH_SUMSQR_FUNC
+#undef DEVICE_REDUCE_SIZE_THRESHOLD
 
 namespace {
 template <typename T>
@@ -1386,6 +1511,82 @@ void CopyMatrix<CUDAContext>(
     CUDAContext* context) {
   cudaMemcpy2DAsync(B, ldb * itemsize, A, lda * itemsize, N * itemsize, M,
                     cudaMemcpyDeviceToDevice, context->cuda_stream());
+}
+
+namespace {
+__global__ void rowwise_max_kernel(
+    const int rows,
+    const int cols,
+    const float* data,
+    float* out) {
+  typedef cub::BlockReduce<float, CAFFE_CUDA_NUM_THREADS> BlockReduce;
+  __shared__ typename BlockReduce::TempStorage temp_storage;
+  for (int rowIndex = blockIdx.x; rowIndex < rows; rowIndex += gridDim.x) {
+    float maxval = -FLT_MAX;
+    // NB: The memory accesses here are sequentialized; without unrolling
+    // the loop, there will not be any ILP.  However, because we are running
+    // this kernel with a lot of threads, this should not be a big problem.
+    // However, if we reduce the number of threads to take advantage of
+    // warp-wide synchronization, this may become a problem again.
+    for (int colIndex = threadIdx.x; colIndex < cols; colIndex += blockDim.x) {
+      maxval = max(data[rowIndex * cols + colIndex], maxval);
+    }
+    maxval = BlockReduce(temp_storage).Reduce(maxval, cub::Max());
+    if (threadIdx.x == 0) {
+      out[rowIndex] = maxval;
+    }
+    __syncthreads();
+  }
+}
+
+__global__ void colwise_max_kernel(
+    const int rows,
+    const int cols,
+    const float* data,
+    float* out) {
+  typedef cub::BlockReduce<float, CAFFE_CUDA_NUM_THREADS> BlockReduce;
+  __shared__ typename BlockReduce::TempStorage temp_storage;
+  for (int colIndex = blockIdx.x; colIndex < cols; colIndex += gridDim.x) {
+    float maxval = -FLT_MAX;
+    for (int rowIndex = threadIdx.x; rowIndex < rows; rowIndex += blockDim.x) {
+      maxval = max(data[rowIndex * cols + colIndex], maxval);
+    }
+    maxval = BlockReduce(temp_storage).Reduce(maxval, cub::Max());
+    if (threadIdx.x == 0) {
+      out[colIndex] = maxval;
+    }
+    __syncthreads();
+  }
+}
+
+} // namespace
+
+template <>
+void RowwiseMax(
+    const int N,
+    const int D,
+    const float* x,
+    float* y,
+    CUDAContext* context) {
+  rowwise_max_kernel<<<
+      std::min(N, CAFFE_MAXIMUM_NUM_BLOCKS),
+      CAFFE_CUDA_NUM_THREADS,
+      0,
+      context->cuda_stream()>>>(N, D, x, y);
+}
+
+template <>
+void ColwiseMax(
+    const int N,
+    const int D,
+    const float* x,
+    float* y,
+    CUDAContext* context) {
+  colwise_max_kernel<<<
+      std::min(D, CAFFE_MAXIMUM_NUM_BLOCKS),
+      CAFFE_CUDA_NUM_THREADS,
+      0,
+      context->cuda_stream()>>>(N, D, x, y);
 }
 
 }  // namespace math

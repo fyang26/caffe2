@@ -199,6 +199,9 @@ class OpSchema {
   // Remove from documentation
   OpSchema& Private();
 
+  // This op can pass data across devices
+  OpSchema& InputsCanCrossDevices();
+
   /**
    * @brief A function to allow one to get the number of outputs based on the
    * number of inputs, if this schema supports it.
@@ -219,6 +222,9 @@ class OpSchema {
   bool private_op() {
     return private_;
   }
+  bool inputs_can_cross_devices() const {
+    return inputs_can_cross_devices_;
+  }
 
   /**
    * @brief Returns the required device location of inputs and outputs.
@@ -238,6 +244,13 @@ class OpSchema {
   }
 
  private:
+  [[noreturn]] Cost DefaultConstInferenceFunction(
+      const OperatorDef&,
+      const vector<TensorShape>&) {
+    CAFFE_THROW("No cost inference function registered.");
+  }
+
+ private:
   string file_;
   string doc_;
   std::vector<std::pair<const char*, const char*>> arg_desc_{};
@@ -249,6 +262,7 @@ class OpSchema {
   int min_output_ = 0;
   int max_output_ = std::numeric_limits<int>::max();
   bool private_ = false;
+  bool inputs_can_cross_devices_ = false;
   std::function<bool(int)> num_inputs_allowed_
       = [](int) { return true; };
   std::function<bool(int)> num_outputs_allowed_
@@ -271,11 +285,11 @@ class OpSchema {
         }
         return out;
       };
-  CostInferenceFunctionType cost_inference_function_ =
-      [](const OperatorDef& def, const vector<TensorShape>&) {
-        CAFFE_THROW("No cost inference function registered.");
-        return Cost();
-      };
+  CostInferenceFunctionType cost_inference_function_ = std::bind(
+      &OpSchema::DefaultConstInferenceFunction,
+      this,
+      std::placeholders::_1,
+      std::placeholders::_2);
   DeviceInferenceFunctionType device_inference_function_ =
       [](const OperatorDef& def) {
         auto op_device =

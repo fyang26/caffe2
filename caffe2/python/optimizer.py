@@ -115,12 +115,14 @@ class Optimizer(object):
 
 class SgdOptimizer(Optimizer):
     def __init__(self, base_learning_rate=0.01, policy='fixed',
-                 momentum=0.0, nesterov=1, **kwargs):
+                 momentum=0.0, nesterov=1, sparse_dedup_aggregator=None,
+                 **kwargs):
         super(SgdOptimizer, self).__init__()
         self.base_learning_rate = base_learning_rate
         self.policy = policy
         self.momentum = momentum
         self.nesterov = nesterov
+        self.sparse_dedup_aggregator = sparse_dedup_aggregator
         self.init_kwargs = kwargs
 
     def _run(self, net, param_init_net, param_info):
@@ -163,6 +165,7 @@ class SgdOptimizer(Optimizer):
 
         if isinstance(grad, core.GradientSlice):
             assert self.momentum == 0., "Doesn't support momentum for sparse"
+            grad = self.dedup(net, self.sparse_dedup_aggregator, grad)
             net.ScatterWeightedSum(
                 [param, ONE, grad.indices, grad.values, lr],
                 param
@@ -189,12 +192,14 @@ class SgdOptimizer(Optimizer):
 
 class MultiPrecisionSgdOptimizer(SgdOptimizer):
     def __init__(self, base_learning_rate=0.1, momentum=0.0,
-                 policy="fixed", nesterov=1, **kwargs):
+                 policy="fixed", nesterov=1, sparse_dedup_aggregator=None,
+                 **kwargs):
         super(SgdOptimizer, self).__init__()
         self.base_learning_rate = base_learning_rate
         self.momentum = momentum
         self.policy = policy
         self.nesterov = nesterov
+        self.sparse_dedup_aggregator = sparse_dedup_aggregator
         self.init_kwargs = kwargs
 
     def _run(self, net, param_init_net, param_info):
@@ -232,7 +237,7 @@ class MultiPrecisionSgdOptimizer(SgdOptimizer):
         # update (fused) in fp32
         net.MomentumSGDUpdate(
             [grad_fp32, momentum_data, lr, param_fp32],
-            [grad, momentum_data, param_fp32],
+            [grad_fp32, momentum_data, param_fp32],
             momentum=self.momentum,
             nesterov=self.nesterov)
 
@@ -448,6 +453,31 @@ def _get_param_to_device(model):
     return param_to_device
 
 
+def get_param_device(param_name, grad, param_to_device=None, default_device=None):
+    device = default_device
+    param_to_device = param_to_device or {}
+    # We first check if parameter's device has been inferred. If not,
+    # we check the gradient. This can happen if parameter is not output
+    # by any blob but created by a FetchBlob.
+    if param_name in param_to_device:
+        device = param_to_device[param_name]
+    else:
+        if isinstance(grad, core.GradientSlice):
+            grad = grad
+            if str(grad.values) in param_to_device:
+                device = param_to_device[str(grad.values)]
+            elif str(grad.indices) in param_to_device:
+                device = param_to_device[str(grad.indices)]
+        else:
+            grad_name = str(grad)
+            if grad_name in param_to_device:
+                device = param_to_device[grad_name]
+
+    assert device is not None,\
+        "Cannot infer device for {}: no op creates it".format(param_name)
+    return device
+
+
 def _build(model, optimizer, weights_only=False):
     param_to_device = _get_param_to_device(model)
 
@@ -461,26 +491,7 @@ def _build(model, optimizer, weights_only=False):
                 continue
         param_name = str(param_info.blob)
 
-        # We first check if parameter's device has been inferred. If not,
-        # we check the gradient. This can happen if parameter is not output
-        # by any blob but created by a FetchBlob.
-        device = None
-        if param_name in param_to_device:
-            device = param_to_device[param_name]
-        else:
-            if isinstance(param_info.grad, core.GradientSlice):
-                grad = param_info.grad
-                if str(grad.values) in param_to_device:
-                    device = param_to_device[str(grad.values)]
-                elif str(grad.indices) in param_to_device:
-                    device = param_to_device[str(grad.indices)]
-            else:
-                grad_name = str(param_info.grad)
-                if grad_name in param_to_device:
-                    device = param_to_device[grad_name]
-
-        assert device is not None,\
-            "Cannot infer device for {}: no op creates it".format(param_name)
+        device = get_param_device(param_name, param_info.grad, param_to_device)
 
         with core.DeviceScope(device):
             optimizer(model.net, model.param_init_net, param_info)
