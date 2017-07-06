@@ -217,7 +217,7 @@ class TestCreateOperator(test_util.TestCase):
         self.assertEqual(op.arg[1].name, "arg2")
         self.assertEqual(op.arg[2].name, "arg3")
         self.assertEqual(op.arg[0].i, 1)
-        self.assertEqual(op.arg[1].s, "2")
+        self.assertEqual(op.arg[1].s, b"2")
         self.assertEqual(list(op.arg[2].ints), [1, 2, 3])
 
     def testCreateWithNoneKwarg(self):
@@ -316,6 +316,116 @@ class TestAppendNet(test_util.TestCase):
         netB.Sum(["in3", "in4"], ["in1"])
         netA.AppendNet(netB)  # note different order than in prev test
         self.assertTrue("in1" in netA.external_inputs)
+
+
+class TestExtractPredictorNet(test_util.TestCase):
+
+    def test_extract_simple(self):
+        from caffe2.python import brew
+        from caffe2.python.model_helper import ModelHelper, ExtractPredictorNet
+
+        model = ModelHelper(name="test", arg_scope={'order': 'NCHW'})
+        [data, label] = brew.image_input(
+            model,
+            "reader", ["xx/data", "label"],
+        )
+        cnv = brew.conv(model, data, 'cnv', 32, 32, 4)
+        a = brew.fc(model, cnv, 'a', 100, 200)
+        pred = brew.fc(model, a, 'pred', 200, 5)
+        brew.softmax(model, [pred, label], "softmax")
+
+        (predict_net, export_blobs) = ExtractPredictorNet(
+            net_proto=model.net.Proto(),
+            input_blobs=["xx/data"],
+            output_blobs=["pred"],
+            renames={"xx/data": "image"},
+        )
+        export_blobs = set(export_blobs)
+
+        ops = list(predict_net.Proto().op)
+        for op in ops:
+            self.assertFalse(op.type == "Softmax")
+            self.assertFalse("xx/data" in op.input)
+
+        # Note: image input should not be included
+        self.assertEquals(ops[0].type, "Conv")
+        self.assertEquals(ops[1].type, "FC")
+        self.assertEquals(ops[2].type, "FC")
+        self.assertEquals(len(ops), 3)
+
+        # test rename happened
+        self.assertEquals(ops[0].input[0], "image")
+
+        # Check export blobs
+        self.assertTrue("image" not in export_blobs)
+        self.assertTrue("xx/data" not in export_blobs)
+        self.assertEqual(set([str(p) for p in model.params]), export_blobs)
+
+        # Check external inputs/outputs
+        self.assertTrue("image" in predict_net.Proto().external_input)
+        self.assertEquals(set(["pred"]), set(predict_net.Proto().external_output))
+        self.assertEqual(
+            set(predict_net.Proto().external_input) -
+            set([str(p) for p in model.params]), set(["image"])
+        )
+
+
+class TestInferDevice(test_util.TestCase):
+
+    def setUp(self):
+        device_option = caffe2_pb2.DeviceOption()
+        device_option.device_type = caffe2_pb2.CUDA
+        device_option.cuda_gpu_id = 1
+        self.cuda_option = device_option
+        self.cpu_option = caffe2_pb2.DeviceOption()
+
+    def _test_op(
+        self,
+        op_name,
+        in_option,
+        out_option,
+        op_option=None,
+        inputs=None,
+        outputs=None
+    ):
+        op_option = self.cuda_option if not op_option else op_option
+        inputs = ["blob_1"] if not inputs else inputs
+        outputs = ["blob_2"] if not outputs else outputs
+        with core.DeviceScope(op_option):
+            op = core.CreateOperator(op_name, inputs, outputs)
+        input_dev, output_dev = core.InferOpBlobDevices(op)
+        for in_dev in input_dev:
+            self.assertEqual(in_dev, in_option)
+        for out_dev in output_dev:
+            self.assertEqual(out_dev, out_option)
+
+    def test_infer_device(self):
+        self._test_op(
+            "FC",
+            self.cuda_option,
+            self.cuda_option,
+            op_option=self.cuda_option,
+            inputs=["data", "fc_w", "fc_b"],
+            outputs=["fc_1"]
+        )
+
+    def test_infer_device_cross_device(self):
+        self._test_op("CopyGPUToCPU", self.cuda_option, self.cpu_option)
+        self._test_op("CopyCPUToGPU", self.cpu_option, self.cuda_option)
+        self._test_op("EnsureCPUOutput", self.cuda_option, self.cpu_option)
+        self._test_op("CopyFromCPUInput", self.cpu_option, self.cuda_option)
+        self._test_op(
+            "EnsureCPUOutput",
+            self.cpu_option,
+            self.cpu_option,
+            op_option=self.cpu_option
+        )
+        self._test_op(
+            "CopyFromCPUInput",
+            self.cpu_option,
+            self.cpu_option,
+            op_option=self.cpu_option
+        )
 
 
 if __name__ == '__main__':

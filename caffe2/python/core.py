@@ -5,8 +5,15 @@ from __future__ import division
 from __future__ import print_function
 from __future__ import unicode_literals
 
-from collections import namedtuple
-from collections import OrderedDict
+from collections import namedtuple, OrderedDict
+try:
+    from past.builtins import basestring
+except ImportError:
+    print("You don't have the past package installed. ",
+          "This is necessary for python 2/3 compatibility. ",
+          "To do this, do 'pip install future'.")
+    import sys
+    sys.exit(1)
 
 from caffe2.proto import caffe2_pb2
 from collections import defaultdict
@@ -40,13 +47,6 @@ def _InitDataType():
 
 _InitDataType()
 
-# Python 2 and 3 compatibility: test if basestring exists
-try:
-    basestring = basestring  # NOQA
-except NameError:
-    # This is python3 so we define basestring.
-    basestring = str
-
 
 def _GetRegisteredOperators():
     return set(workspace.RegisteredOperators())
@@ -75,13 +75,17 @@ def GetGlobalInitArgs():
 _WORKER_INIT_CALLS = []
 
 
-def register_worker_init_call(func, *args, **kwargs):
+def worker_init_func(func):
     """
-    Function calls registered here will be called with given args at startup
-    in each of the worker nodes. The function as well as all of the arguments
-    passed must be picklable.
+    By decorating a function with this, each call to the function will be
+    recorded at workflow time and replayed in each of the works at startup.
+    Used for example for registering caffe python operators.
     """
-    _WORKER_INIT_CALLS.append((func, args, kwargs))
+    def call(*args, **kwargs):
+        _WORKER_INIT_CALLS.append((func, args, kwargs))
+        return func(*args, **kwargs)
+
+    return call
 
 
 def GetWorkerInitCalls():
@@ -103,6 +107,37 @@ def DeviceOption(device_type, cuda_gpu_id=0, random_seed=None):
     if random_seed is not None:
         option.random_seed = random_seed
     return option
+
+
+def InferBlobDevices(net):
+    '''
+    Compute mapping from parameters to devices by looking at the
+    device option of the op that creates the blob has
+    '''
+    mapping = {}
+    for op in net.Proto().op:
+        op_device = op.device_option
+        if op_device is None:
+            op_device = caffe2_pb2.DeviceOption(caffe2_pb2.CPU)
+        # TODO: T18892922, use device annotations
+        for b in op.output:
+            mapping[b] = op_device
+    return mapping
+
+
+def InferOpBlobDevices(op):
+    device_info = C.infer_op_input_output_device(op.SerializeToString())
+    input_info = []
+    output_info = []
+    for dev_str in device_info[0]:
+        device_option = caffe2_pb2.DeviceOption()
+        device_option.ParseFromString(dev_str)
+        input_info.append(device_option)
+    for dev_str in device_info[1]:
+        device_option = caffe2_pb2.DeviceOption()
+        device_option.ParseFromString(dev_str)
+        output_info.append(device_option)
+    return input_info, output_info
 
 
 GradientSlice = namedtuple('GradientSlice', ['indices', 'values'])
@@ -212,6 +247,8 @@ class BlobReference(object):
 
 def ScopedName(name):
     """prefix the name with the current scope."""
+    if isinstance(name, bytes):
+        name = name.decode('ascii')
     return scope.CurrentNameScope() + name
 
 
@@ -308,7 +345,6 @@ def CreateOperator(
 
 def _RegisterPythonImpl(
     f, grad_f=None, python_func_type=None, pass_workspace=False, name=None,
-    allow_prefix=True,
 ):
     if python_func_type:
         func = python_func_type(f)
@@ -320,7 +356,7 @@ def _RegisterPythonImpl(
         if isinstance(grad_f, tuple):
             grad_f = grad_f[0](*grad_f[1], **grad_f[2])
 
-    token = C.register_python_op(f, pass_workspace, name or '', allow_prefix)
+    token = C.register_python_op(f, pass_workspace, name or '')
     if grad_f:
         C.register_python_gradient_op(token, grad_f)
     return token
@@ -630,7 +666,7 @@ class IR(object):
 
         sum_ops = [CreateOperator(
             "Sum",
-            map(BlobReference, sum_op_input),
+            [BlobReference(x) for x in sum_op_input],
             BlobReference(out_base_name))]
         return sum_ops, out_base_name
 
@@ -667,15 +703,16 @@ class IR(object):
         sum_ops = [
             CreateOperator(
                 "Concat",
-                map(BlobReference, indices_concat_input),
-                map(BlobReference,
-                    [indices_concat_output, indices_concat_split]),
+                [BlobReference(x) for x in indices_concat_input],
+                [BlobReference(x) for x in
+                    [indices_concat_output, indices_concat_split]],
                 axis=0
             ),
             CreateOperator(
                 "Concat",
-                map(BlobReference, values_concat_input),
-                map(BlobReference, [values_concat_output, values_concat_split]),
+                [BlobReference(x) for x in values_concat_input],
+                [BlobReference(x) for x in
+                    [values_concat_output, values_concat_split]],
                 axis=0
             ),
         ]
@@ -727,10 +764,6 @@ class IR(object):
                     all_device_options.append(g.grad_op_values.device_option)
                     all_gradient_names.append(g.gradient.values)
 
-        # Check if all grad names are the same.
-        if len(set(all_gradient_names)) > 1:
-            raise RuntimeError('Unexpected behavior: not all grad output '
-                               'names are the same.')
         # Check if all grad op device options are the same.
         if len(all_device_options) >= 2 and not all(
                 d == all_device_options[0] for d in all_device_options[1:]):
@@ -784,10 +817,22 @@ class IR(object):
             grad_map[input_name] = g
         return additional_sum_ops, grad_map
 
+    def _AppendAutoGradGenerator(self, y, grad, autograd_op):
+        # Gradient here is not sparse  as it was generated by
+        # a ConstantFill operator. Autogeneration for sparse gradients is
+        # not supported
+        generator = GradGenMeta(
+            autograd_op, 0 if autograd_op else None, str(grad))
+
+        self.gradient_generators[str(y)][self.frontier[str(y)]].append(
+            generator)
+
+
     def _GetInitGradients(self, ys):
         input_to_grad = {}
         gradient_ops = []
         for y, g in ys.items():
+            autograd_op = None
             if g is None:
                 autograd_op = CreateOperator(
                     "ConstantFill", [y], [str(y) + "_autogen_grad"],
@@ -799,6 +844,10 @@ class IR(object):
             input_to_grad[str(y)] = (
                 GradientSlice(str(g[0]), str(g[1]))
                 if isinstance(g, GradientSlice) else str(g))
+            # Autogenerated gradients are assumed to be provided for the last
+            # input version
+            if autograd_op is not None:
+                self._AppendAutoGradGenerator(y, g, autograd_op)
 
         return input_to_grad, gradient_ops
 
@@ -849,6 +898,8 @@ class IR(object):
         # gradients.
         for y, _ in ys.items():
             self.gradient_frontier[y] = self.frontier[y]
+            self.input_usages[str(y)][self.frontier[str(y)]].append(
+                len(self.ssa))
 
         all_input_to_grad, all_gradient_ops = self._GetInitGradients(ys)
 
@@ -962,7 +1013,7 @@ class GradientRegistry(object):
         return gradient_ops, g_input
 
     @classmethod
-    def GetBackwardPass(cls, operators, ys):
+    def GetBackwardPass(cls, operators, ys, ys_generate_gradient=False):
         """Gets the backward pass for the list of operators.
 
         Args:
@@ -1150,8 +1201,9 @@ class Net(object):
 
     @staticmethod
     def _get_next_net_name(basename):
-        name = basename = '/'.join(filter(
-            lambda x: x, (Net.current_prefix(), basename)))
+        name = basename = '/'.join(
+            x for x in [Net.current_prefix(), basename] if x
+        )
         next_idx = 1
         while name in Net._net_names_used:
             name = basename + '_' + str(next_idx)
@@ -1372,7 +1424,7 @@ class Net(object):
         if blob_remap is None:
             blob_remap = {}
         if op_id_mask is None:
-            op_id_mask = range(0, len(proto.op))
+            op_id_mask = list(range(0, len(proto.op)))
 
         def get_remapped_str(blob):
             blob_str = str(blob)
@@ -1637,11 +1689,11 @@ class Net(object):
 
     @property
     def external_inputs(self):
-        return map(_get_blob_ref, self._net.external_input)
+        return [_get_blob_ref(x) for x in self._net.external_input]
 
     @property
     def external_outputs(self):
-        return map(_get_blob_ref, self._net.external_output)
+        return [_get_blob_ref(x) for x in self._net.external_output]
 
     def set_input_record(self, input_record):
         from caffe2.python import schema
@@ -1768,12 +1820,18 @@ class Net(object):
             additional_methods))
 
     def Python(
-        self, f, grad_f=None, python_func_type=None, pass_workspace=False,
+        self,
+        f,
+        grad_f=None,
+        python_func_type=None,
+        pass_workspace=False,
+        grad_output_indices=None,
+        grad_input_indices=None
     ):
         """
         Registers and returns a python operator.
 
-        `f` and `f_grad` can be one of the following:
+        `f` and `grad_f` can be one of the following:
             - a function with signature (inputs, outputs), where inputs and
               outputs are a list of CPUTensor objects. This function will be
               called from C++ everytime the operator is executed.
@@ -1796,28 +1854,39 @@ class Net(object):
         (inputs, outputs, workspace) where `workspace` is the workspace the op
         is going to run on. This is potentially dangerous (as the op can
         manipulate the workspace directly), use on your own risk.
+
+        If a gradient function is specified (`grad_f`), by default its inputs
+        will be: (1) all inputs to `f`, (2) followed by all outputs of `f`, (3)
+        and then all gradient outputs of `f`. The outputs of `grad_f` will be
+        (by default) all gradient inputs to `f`. If a subset of the gradient
+        outputs or gradient inputs is desired instead, then the subsets can be
+        specified by providing `grad_output_indices` and/or `grad_input_indices`
+        which identify the indices of `f`'s inputs and outputs which have
+        gradients.
         """
         assert(IsOperator('Python'))
-        registry_args = dict(
-            f=f,
-            grad_f=grad_f,
-            python_func_type=python_func_type,
-            pass_workspace=pass_workspace,
-            name='%s:%d' % (str(self), len(self.Proto().op)),
-            allow_prefix=True,
-        )
-        token = _RegisterPythonImpl(**registry_args)
         if isinstance(f, tuple) or isinstance(grad_f, tuple):
             # if we got a tuple, we will make sure this tuple will be
             # registered to run at startup on each of the workers in a
-            # distributed run. Here we make sure that the registration
-            # will happen with the exact same token, or fail if the token
-            # already exists.
-            registry_args['name'] = token
-            registry_args['allow_prefix'] = False
-            register_worker_init_call(_RegisterPythonImpl, **registry_args)
+            # distributed run.
+            registry = worker_init_func(_RegisterPythonImpl)
+        else:
+            registry = _RegisterPythonImpl
+
+        token = registry(
+            f, grad_f, python_func_type, pass_workspace=pass_workspace,
+            name='%s:%d' % (str(self), len(self.Proto().op))
+        )
+        grad_output_indices = grad_output_indices or []
+        grad_input_indices = grad_input_indices or []
         return lambda *args, **kwargs: self._CreateAndAddToSelf(
-            'Python', token=token, *args, **kwargs)
+            'Python',
+            token=token,
+            grad_output_indices=grad_output_indices,
+            grad_input_indices=grad_input_indices,
+            *args,
+            **kwargs
+        )
 
 
 def get_net_name(netlike):
@@ -2115,9 +2184,11 @@ def execution_step(default_name,
         step.AddNet(steps_or_nets)
     elif isinstance(steps_or_nets, list):
         if all(isinstance(x, Net) for x in steps_or_nets):
-            map(step.AddNet, steps_or_nets)
+            for x in steps_or_nets:
+                step.AddNet(x)
         else:
-            map(step.AddSubstep, map(to_execution_step, steps_or_nets))
+            for x in steps_or_nets:
+                step.AddSubstep(to_execution_step(x))
     elif steps_or_nets:
         raise ValueError(
             'steps_or_nets must be a step, a net, or a list of nets or steps.')

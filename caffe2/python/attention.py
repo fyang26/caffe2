@@ -5,9 +5,11 @@ from __future__ import division
 from __future__ import print_function
 from __future__ import unicode_literals
 
+from caffe2.python import brew
+
 
 class AttentionType:
-    Regular, Recurrent = range(2)
+    Regular, Recurrent = tuple(range(2))
 
 
 def s(scope, name):
@@ -29,7 +31,6 @@ def _calc_weighted_context(
         [encoder_outputs_transposed, attention_weights_3d],
         s(scope, 'attention_weighted_encoder_context'),
     )
-    # TODO: somehow I cannot use Squeeze in-place op here
     # [batch_size, encoder_output_dim]
     attention_weighted_encoder_context, _ = model.net.Reshape(
         attention_weighted_encoder_context,
@@ -50,18 +51,13 @@ def _calc_attention_weights(
 ):
     # TODO: we could try to force some attention weights to be zeros,
     # based on encoder_lengths.
-    # [batch_size, encoder_length]
-    attention_weights = model.Softmax(
-        attention_logits_transposed,
-        s(scope, 'attention_weights'),
-        engine='CUDNN',
-    )
-    # TODO: make this operation in-place
     # [batch_size, encoder_length, 1]
-    attention_weights_3d = model.net.ExpandDims(
-        attention_weights,
+    attention_weights_3d = brew.softmax(
+        model,
+        attention_logits_transposed,
         s(scope, 'attention_weights_3d'),
-        dims=[2],
+        engine='CUDNN',
+        axis=1,
     )
     return attention_weights_3d
 
@@ -84,7 +80,7 @@ def _calc_attention_logits_from_sum_match(
         s(scope, 'attention_v'),
         shape=[1, encoder_output_dim],
     )
-    model.add_param(attention_v)
+    model.params.append(attention_v)
 
     attention_zeros = model.param_init_net.ConstantFill(
         [],
@@ -99,17 +95,11 @@ def _calc_attention_logits_from_sum_match(
         [s(scope, 'attention_logits')],
         axis=2,
     )
-    # [encoder_length, batch_size]
-    attention_logits = model.net.Squeeze(
-        [attention_logits],
-        [attention_logits],
-        dims=[2],
-    )
-    # [batch_size, encoder_length]
+    # [batch_size, encoder_length, 1]
     attention_logits_transposed = model.Transpose(
         attention_logits,
         s(scope, 'attention_logits_transposed'),
-        axes=[1, 0],
+        axes=[1, 0, 2],
     )
     return attention_logits_transposed
 
@@ -123,7 +113,8 @@ def _apply_fc_weight_for_sum_match(
     scope,
     name,
 ):
-    output = model.FC(
+    output = brew.fc(
+        model,
         input,
         s(scope, name),
         dim_in=dim_in,

@@ -4,7 +4,6 @@ from __future__ import print_function
 from __future__ import unicode_literals
 
 from caffe2.python import recurrent, workspace
-from caffe2.python.cnn import CNNModelHelper
 from caffe2.python.model_helper import ModelHelper
 from hypothesis import given
 import caffe2.python.hypothesis_test_util as hu
@@ -220,7 +219,7 @@ class RecurrentNetworkTest(hu.HypothesisTestCase):
         if we apply convolution over all elements simultaneously,
         since the whole input_state sequence was generated at the end.
     '''
-        model = CNNModelHelper(name='model')
+        model = ModelHelper(name='model')
         fake_inputs = model.param_init_net.UniformFill(
             [],
             'fake_inputs',
@@ -240,7 +239,7 @@ class RecurrentNetworkTest(hu.HypothesisTestCase):
             value=0.0,
             shape=[1, batch_size, state_size],
         )
-        step_model = CNNModelHelper(name='step_model', param_model=model)
+        step_model = ModelHelper(name='step_model', param_model=model)
         (
             fake_input_t,
             timestep,
@@ -287,19 +286,19 @@ class RecurrentNetworkTest(hu.HypothesisTestCase):
         input_state_all, output_state_all, _ = model.net.RecurrentNetwork(
             all_inputs,
             all_outputs + ['step_workspaces'],
-            param=map(all_inputs.index, step_model.params),
+            param=[all_inputs.index(p) for p in step_model.params],
             alias_src=recurrent_states,
             alias_dst=all_outputs,
             alias_offset=[conv_window - 1, 1],
             recurrent_states=recurrent_states,
-            initial_recurrent_state_ids=map(
-                all_inputs.index,
-                initial_recurrent_states,
-            ),
-            link_internal=map(
-                str,
-                [input_state_t_prev, input_state_t, output_state_t],
-            ),
+            initial_recurrent_state_ids=[
+                all_inputs.index(s) for s in initial_recurrent_states
+            ],
+            link_internal=[
+                str(input_state_t_prev),
+                str(input_state_t),
+                str(output_state_t),
+            ],
             link_external=['input_state', 'input_state', 'output_state'],
             link_offset=[0, conv_window - 1, 1],
             link_window=[conv_window, 1, 1],

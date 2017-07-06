@@ -73,13 +73,7 @@ class Node(object):
         others blobs.
 
         Additionally, a Node can be passed implementation-specific kwargs,
-        in order to specify properties of the node. When using AML Flow,
-        we currently support:
-            resource_requirements: a fblearner.flow.api.ResourceRequirements
-                                   specifying requirements for this Node.
-            flow_returns: a fblearner.flow.api.types.Schema object specifying
-                          the output schema of the Flow operator where the
-                          Node will run.
+        in order to specify properties of the node.
     """
 
     def __init__(self, node='local', **kwargs):
@@ -512,9 +506,11 @@ class Task(object):
 
     def get_step(self):
         if self._step is not None and self._step_with_setup is None:
-            report_steps = filter(
-                lambda s: not hasattr(s, '_report_step_used'),
-                self._step.get_all_attributes(Task.REPORT_STEP))
+            report_steps = [
+                s
+                for s in self._step.get_all_attributes(Task.REPORT_STEP)
+                if not hasattr(s, '_report_step_used')
+            ]
             for step in report_steps:
                 step._report_step_used = True
                 if not step.Proto().run_every_ms:

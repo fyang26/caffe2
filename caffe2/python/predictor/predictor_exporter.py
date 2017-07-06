@@ -11,13 +11,31 @@ from caffe2.python import workspace, core
 from caffe2.python.predictor_constants import predictor_constants
 import caffe2.python.predictor.serde as serde
 import caffe2.python.predictor.predictor_py_utils as utils
-
 import collections
+
+
+def get_predictor_exporter_helper(submodelNetName):
+    """ constracting stub for the PredictorExportMeta
+        Only used to construct names to subfields,
+        such as calling to predict_net_name
+        Args:
+            submodelNetName - name of the model
+    """
+    stub_net = core.Net(submodelNetName)
+    pred_meta = PredictorExportMeta(predict_net=stub_net,
+                                    parameters=[],
+                                    inputs=[],
+                                    outputs=[],
+                                    shapes=None,
+                                    name=submodelNetName,
+                                    extra_init_net=None)
+    return pred_meta
 
 
 class PredictorExportMeta(collections.namedtuple(
     'PredictorExportMeta',
-        'predict_net, parameters, inputs, outputs, shapes, name, extra_init_net')):
+        'predict_net, parameters, inputs, outputs, shapes, name, \
+        extra_init_net, net_type')):
     """
     Metadata to be used for serializaing a net.
 
@@ -27,6 +45,8 @@ class PredictorExportMeta(collections.namedtuple(
 
     Override the named tuple to provide optional name parameter.
     name will be used to identify multiple prediction nets.
+
+    net_type is the type field in caffe2 NetDef - can be 'simple', 'dag', etc.
     """
     def __new__(
         cls,
@@ -36,11 +56,14 @@ class PredictorExportMeta(collections.namedtuple(
         outputs,
         shapes=None,
         name="",
-        extra_init_net=None
+        extra_init_net=None,
+        net_type=None,
     ):
-        inputs = map(str, inputs)
-        outputs = map(str, outputs)
-        parameters = map(str, parameters)
+        inputs = [str(i) for i in inputs]
+        outputs = [str(o) for o in outputs]
+        assert len(set(inputs)) == len(inputs), (
+            "All inputs to the predictor should be unique")
+        parameters = [str(p) for p in parameters]
         shapes = shapes or {}
 
         if isinstance(predict_net, (core.Net, core.Plan)):
@@ -49,7 +72,7 @@ class PredictorExportMeta(collections.namedtuple(
         assert isinstance(predict_net, (caffe2_pb2.NetDef, caffe2_pb2.PlanDef))
         return super(PredictorExportMeta, cls).__new__(
             cls, predict_net, parameters, inputs, outputs, shapes, name,
-            extra_init_net)
+            extra_init_net, net_type)
 
     def inputs_name(self):
         return utils.get_comp_name(predictor_constants.INPUTS_BLOB_TYPE,
@@ -148,8 +171,11 @@ def set_model_info(meta_net_def, project_str, model_class_str, version):
 
 def save_to_db(db_type, db_destination, predictor_export_meta):
     meta_net_def = get_meta_net_def(predictor_export_meta)
-    workspace.FeedBlob(predictor_constants.META_NET_DEF,
-                       serde.serialize_protobuf_struct(meta_net_def))
+    with core.DeviceScope(core.DeviceOption(caffe2_pb2.CPU)):
+        workspace.FeedBlob(
+            predictor_constants.META_NET_DEF,
+            serde.serialize_protobuf_struct(meta_net_def)
+        )
 
     blobs_to_save = [predictor_constants.META_NET_DEF] + \
         predictor_export_meta.parameters

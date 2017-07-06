@@ -5,7 +5,7 @@ from __future__ import unicode_literals
 
 from caffe2.python import core, gradient_checker, rnn_cell, workspace
 from caffe2.python.attention import AttentionType
-from caffe2.python.cnn import CNNModelHelper
+from caffe2.python.model_helper import ModelHelper
 import caffe2.python.hypothesis_test_util as hu
 
 from functools import partial
@@ -380,7 +380,7 @@ def _prepare_lstm(t, n, d, create_lstm, outputs_with_grads,
                   memory_optim, forget_bias, forward_only, drop_states):
     print("Dims: ", t, n, d)
 
-    model = CNNModelHelper(name='external')
+    model = ModelHelper(name='external')
     input_blob, seq_lengths, hidden_init, cell_init = (
         model.net.AddExternalInputs(
             'input_blob', 'seq_lengths', 'hidden_init', 'cell_init'))
@@ -483,7 +483,7 @@ class RNNCellTest(hu.HypothesisTestCase):
             op,
             inputs,
             ref,
-            outputs_to_check=range(4),
+            outputs_to_check=list(range(4)),
         )
 
         # Checking for input, gates_t_w and gates_t_b gradients
@@ -570,7 +570,7 @@ class RNNCellTest(hu.HypothesisTestCase):
         ref,
         gc,
     ):
-        model = CNNModelHelper(name='external')
+        model = ModelHelper(name='external')
         with core.DeviceScope(gc):
             (
                 encoder_outputs,
@@ -659,7 +659,7 @@ class RNNCellTest(hu.HypothesisTestCase):
             reference=ref,
             grad_reference=None,
             output_to_grad=None,
-            outputs_to_check=range(6),
+            outputs_to_check=list(range(6)),
         )
         gradients_to_check = [
             index for (index, input_name) in enumerate(op.input)
@@ -722,7 +722,7 @@ class RNNCellTest(hu.HypothesisTestCase):
         num_layers,
         batch_size,
     ):
-        model = CNNModelHelper(name='external')
+        model = ModelHelper(name='external')
         (
             input_sequence,
             seq_lengths,
@@ -844,5 +844,5 @@ class RNNCellTest(hu.HypothesisTestCase):
                 input_to_check=str(param),
                 print_net=False,
                 step_size=0.0001,
-                threshold=0.1,
+                threshold=0.05,
             )

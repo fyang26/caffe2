@@ -5,7 +5,7 @@ from __future__ import division
 from __future__ import print_function
 from __future__ import unicode_literals
 
-from caffe2.python import schema, scope
+from caffe2.python import core, schema, scope
 from caffe2.python.layers.tags import TagContext
 
 from collections import namedtuple
@@ -19,7 +19,7 @@ IdScoreList = schema.Map(np.int64, np.float32)
 def get_categorical_limit(record):
     if schema.equal_schemas(record, IdList):
         key = 'items'
-    elif schema.equal_schemas(record, IdScoreList):
+    elif schema.equal_schemas(record, IdScoreList, check_field_types=False):
         key = 'keys'
     else:
         raise NotImplementedError()
@@ -102,13 +102,16 @@ def create_layer(layer_name, *args, **kwargs):
 LayerPsParam = namedtuple('LayerPsParam', ['sparse_key', 'average_length'])
 
 
-# TODO(amalevich): Modify this to some better struct, something closer to
-# ParameterInfo.
-LayerParameter = namedtuple(
-    'LayerParameter',
-    ['parameter', 'optimizer', 'initializer', 'ps_param'])
-LayerParameter.__new__.__defaults__ = (None, None, None, None)
+class LayerParameter(object):
 
+    def __init__(self, parameter=None, optimizer=None, initializer=None,
+                 ps_param=None):
+        assert isinstance(parameter, core.BlobReference), \
+            "expect {0} to be a blob reference".format(str(parameter))
+        self.parameter = parameter
+        self.optimizer = optimizer
+        self.initializer = initializer
+        self.ps_param = ps_param
 
 def is_request_only_scalar(scalar):
     if len(scalar.field_metadata()) == 0:
@@ -222,8 +225,27 @@ class ModelLayer(object):
     def get_memory_usage(self):
         return 0
 
+    def add_init_params(self, init_net):
+        '''
+        Adds layer initialization operators to passed net.
+        '''
+        for param in self.params:
+            # TODO(amalevich): Either return back to lambdas, that add
+            # all params (looks a bit safer and breaking less
+            # abstractions) or extend Net interface to this type of
+            # operations better
+            # TODO(xlwang) init_net._net.op has type google.protobuf.\
+            # internal.containers.RepeatedCompositeFieldContainer, but
+            # the version of protobuf in fbcode does not support append
+            # so extend is used
+            init_net._net.op.extend([param.initializer])
+
     def add_operators(self, net, init_net=None,
                       context=InstantiationContext.TRAINING):
+        '''
+        Adds layer trainig or initialization operators to the passed in net.
+        init_net can be None and can be called independently from add_init_params
+        '''
         # Namescope below should warranty that all intermediate blobs will be
         # assiciated with the layer that produces them
         with scope.NameScope(self.name):
@@ -233,12 +255,7 @@ class ModelLayer(object):
                 assert init_net, (
                     "Only prediction and eval context don't need init_net")
             if init_net:
-                for param in self.params:
-                    # TODO(amalevich): Either return back to lambdas, that add
-                    # all params (looks a bit safer and breaking less
-                    # abstractions) or extend Net interface to this type of
-                    # operations better
-                    init_net._net.op.extend([param.initializer])
+                self.add_init_params(init_net)
             if context == InstantiationContext.TRAINING:
                 self.add_train_ops(net)
             elif context == InstantiationContext.EVAL:
